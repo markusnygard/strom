@@ -176,10 +176,39 @@ impl BlockBuilder for VideoEncBuilder {
             convert_element_name, encoder_name, parser_name, caps_str
         );
 
-        // Chain: videoconvert/autovideoconvert -> encoder -> parser -> capsfilter
+        // Chain: autovideoconvert/videoconvert -> capsfilter(NV12,I420) -> queue -> encoder -> parser -> capsfilter(codec)
+        // The capsfilter after videoconvert ensures a pixel format the encoder can accept,
+        // especially for hardware sources (DeckLink) that output UYVY.
+        let pre_caps_id = format!("{}:pre_caps", instance_id);
+        let pre_caps = gst::Caps::builder("video/x-raw")
+            .field("format", gst::List::new(&[
+                &"NV12".to_string(),
+                &"I420".to_string(),
+            ]))
+            .build();
+        let pre_capsfilter = gst::ElementFactory::make("capsfilter")
+            .name(&pre_caps_id)
+            .property("caps", &pre_caps)
+            .build()
+            .map_err(|e| BlockBuildError::ElementCreation(format!("pre_capsfilter: {}", e)))?;
+
+        let queue_id = format!("{}:pre_enc_queue", instance_id);
+        let queue = gst::ElementFactory::make("queue")
+            .name(&queue_id)
+            .build()
+            .map_err(|e| BlockBuildError::ElementCreation(format!("queue: {}", e)))?;
+
         let internal_links = vec![
             (
                 ElementPadRef::pad(&convert_id, "src"),
+                ElementPadRef::pad(&pre_caps_id, "sink"),
+            ),
+            (
+                ElementPadRef::pad(&pre_caps_id, "src"),
+                ElementPadRef::pad(&queue_id, "sink"),
+            ),
+            (
+                ElementPadRef::pad(&queue_id, "src"),
                 ElementPadRef::pad(&encoder_id, "sink"),
             ),
             (
@@ -195,6 +224,8 @@ impl BlockBuilder for VideoEncBuilder {
         Ok(BlockBuildResult {
             elements: vec![
                 (convert_id, videoconvert),
+                (pre_caps_id, pre_capsfilter),
+                (queue_id, queue),
                 (encoder_id, encoder),
                 (parser_id, parser),
                 (capsfilter_id, capsfilter),
