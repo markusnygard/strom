@@ -229,6 +229,20 @@ impl MediaPlayerState {
         self.audio_linked.store(false, Ordering::SeqCst);
         self.ts_offset.store(i64::MIN, Ordering::SeqCst);
 
+        // Cycle appsrc elements through PAUSED→PLAYING so they renegotiate
+        // caps when the new stream starts. Without this, appsrc (is_live=false)
+        // rejects new caps in PLAYING state, producing not-negotiated errors.
+        if let Some(ref appsrc) = self.video_appsrc {
+            let elem = appsrc.upcast_ref::<gst::Element>();
+            let _ = elem.set_state(gst::State::Paused);
+            let _ = elem.set_state(gst::State::Playing);
+        }
+        if let Some(ref appsrc) = self.audio_appsrc {
+            let elem = appsrc.upcast_ref::<gst::Element>();
+            let _ = elem.set_state(gst::State::Paused);
+            let _ = elem.set_state(gst::State::Playing);
+        }
+
         // Set the new URI on source element
         source_element.set_property("uri", &uri);
 

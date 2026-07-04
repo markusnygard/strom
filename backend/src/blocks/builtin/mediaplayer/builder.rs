@@ -148,7 +148,7 @@ fn build_media_player(
     let appsrc_video = gst_app::AppSrc::builder()
         .name(&appsrc_video_id)
         .format(gst::Format::Time)
-        .is_live(true)
+        .is_live(false)
         .automatic_eos(false)
         .max_bytes(APPSRC_MAX_BYTES_VIDEO)
         .max_time(APPSRC_MAX_TIME)
@@ -158,12 +158,30 @@ fn build_media_player(
     let appsrc_audio = gst_app::AppSrc::builder()
         .name(&appsrc_audio_id)
         .format(gst::Format::Time)
-        .is_live(true)
+        .is_live(false)
         .automatic_eos(false)
         .max_bytes(APPSRC_MAX_BYTES_AUDIO)
         .max_time(APPSRC_MAX_TIME)
         .leaky_type(gst_app::AppLeakyType::Upstream)
         .build();
+
+    // Capsfilter between appsrc and queue forces explicit caps negotiation.
+    // Without these, the decoded caps from uridecodebin can't negotiate
+    // with the downstream elements during PAUSED->PLAYING transition.
+    let cfilter_video_id = format!("{}:cfilter_video", instance_id);
+    let cfilter_audio_id = format!("{}:cfilter_audio", instance_id);
+
+    let cfilter_video = gst::ElementFactory::make("capsfilter")
+        .name(&cfilter_video_id)
+        .build()
+        .map_err(|e| BlockBuildError::ElementCreation(format!("cfilter_video: {}", e)))?;
+    cfilter_video.set_property_from_str("caps", "video/x-raw");
+
+    let cfilter_audio = gst::ElementFactory::make("capsfilter")
+        .name(&cfilter_audio_id)
+        .build()
+        .map_err(|e| BlockBuildError::ElementCreation(format!("cfilter_audio: {}", e)))?;
+    cfilter_audio.set_property_from_str("caps", "audio/x-raw");
 
     let video_out = gst::ElementFactory::make("identity")
         .name(&video_out_id)
@@ -267,10 +285,14 @@ fn build_media_player(
         .build()
         .map_err(|e| BlockBuildError::ElementCreation(format!("queue_audio: {}", e)))?;
 
-    // --- Static links: appsrc → queue → identity ---
+    // --- Static links: appsrc → capsfilter → queue → identity ---
     let internal_links = vec![
         (
             ElementPadRef::pad(&appsrc_video_id, "src"),
+            ElementPadRef::pad(&cfilter_video_id, "sink"),
+        ),
+        (
+            ElementPadRef::pad(&cfilter_video_id, "src"),
             ElementPadRef::pad(&queue_video_id, "sink"),
         ),
         (
@@ -279,6 +301,10 @@ fn build_media_player(
         ),
         (
             ElementPadRef::pad(&appsrc_audio_id, "src"),
+            ElementPadRef::pad(&cfilter_audio_id, "sink"),
+        ),
+        (
+            ElementPadRef::pad(&cfilter_audio_id, "src"),
             ElementPadRef::pad(&queue_audio_id, "sink"),
         ),
         (
@@ -290,9 +316,11 @@ fn build_media_player(
     Ok(BlockBuildResult {
         elements: vec![
             (appsrc_video_id, appsrc_video.upcast()),
+            (cfilter_video_id, cfilter_video),
             (queue_video_id, queue_video),
             (video_out_id, video_out),
             (appsrc_audio_id, appsrc_audio.upcast()),
+            (cfilter_audio_id, cfilter_audio),
             (queue_audio_id, queue_audio),
             (audio_out_id, audio_out),
         ],
