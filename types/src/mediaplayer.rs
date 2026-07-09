@@ -70,6 +70,14 @@ pub struct GotoRequest {
     pub index: usize,
 }
 
+/// Request to enable or disable playlist looping at runtime.
+#[derive(Debug, Clone, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(ToSchema))]
+pub struct SetLoopRequest {
+    /// Whether the playlist should loop
+    pub enabled: bool,
+}
+
 /// Response with the current player state.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "openapi", derive(ToSchema))]

@@ -320,6 +320,10 @@ pub async fn create_app_with_config(
             "/flows/{flow_id}/blocks/{block_id}/player/goto",
             post(api::mediaplayer::goto_file),
         )
+        .route(
+            "/flows/{flow_id}/blocks/{block_id}/player/loop",
+            post(api::mediaplayer::set_loop),
+        )
         // Logging
         .route("/log-level", get(api::logging::get_log_level))
         .route("/log-level", put(api::logging::set_log_level))

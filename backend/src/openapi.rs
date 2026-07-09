@@ -32,7 +32,7 @@ use strom_types::events::StromEvent;
 use strom_types::flow::{FlowProperties, GStreamerClockType};
 use strom_types::mediaplayer::{
     GotoRequest, PlayerAction, PlayerControlRequest, PlayerStateResponse, SeekRequest,
-    SetPlaylistRequest,
+    SetLoopRequest, SetPlaylistRequest,
 };
 use strom_types::network::{
     Ipv4AddressInfo, Ipv6AddressInfo, NetworkInterfaceInfo, NetworkInterfacesResponse,
@@ -155,6 +155,7 @@ use utoipa::OpenApi;
         crate::api::mediaplayer::control_player,
         crate::api::mediaplayer::seek_player,
         crate::api::mediaplayer::goto_file,
+        crate::api::mediaplayer::set_loop,
         // Probe endpoints
         crate::api::probes::activate_probe,
         crate::api::probes::list_probes,
@@ -277,6 +278,7 @@ use utoipa::OpenApi;
             SetPlaylistRequest,
             SeekRequest,
             GotoRequest,
+            SetLoopRequest,
             PlayerStateResponse,
             // Auth types
             LoginRequest,

@@ -44,6 +44,10 @@ pub struct MediaPlayerState {
     pub playlist: RwLock<Playlist>,
     /// Whether playback is paused
     pub is_paused: AtomicBool,
+    /// Whether playback is stopped (explicit stop or end of playlist).
+    /// Takes precedence over `is_paused` in `state()` — stop is implemented
+    /// as pause + seek(0), so both flags are set when stopped.
+    pub is_stopped: AtomicBool,
     /// Whether to loop the playlist
     pub loop_playlist: AtomicBool,
     /// Block ID for event broadcasting
@@ -121,10 +125,14 @@ impl MediaPlayerState {
             }
             pl.current_index = index;
         }
-        self.load_current_file()
+        self.switching_file.store(true, Ordering::SeqCst);
+        let r = self.load_current_file();
+        self.switching_file.store(false, Ordering::SeqCst);
+        r
     }
 
     /// Advance to the next file.
+    /// Caller must set `switching_file` before calling and clear it after.
     pub fn next(&self) -> Result<(), String> {
         {
             let mut pl = self
@@ -149,6 +157,7 @@ impl MediaPlayerState {
     }
 
     /// Go to the previous file.
+    /// Caller must set `switching_file` before calling and clear it after.
     pub fn previous(&self) -> Result<(), String> {
         {
             let mut pl = self
@@ -177,10 +186,7 @@ impl MediaPlayerState {
     /// file, then sets the new URI and restarts. The pad-added callback will recreate
     /// the clocksync→appsink chain for the new file's pads.
     fn load_current_file(&self) -> Result<(), String> {
-        self.switching_file.store(true, Ordering::SeqCst);
-        let result = self.load_current_file_inner();
-        self.switching_file.store(false, Ordering::SeqCst);
-        result
+        self.load_current_file_inner()
     }
 
     fn load_current_file_inner(&self) -> Result<(), String> {
@@ -229,9 +235,19 @@ impl MediaPlayerState {
         self.audio_linked.store(false, Ordering::SeqCst);
         self.ts_offset.store(i64::MIN, Ordering::SeqCst);
 
-        // Cycle appsrc elements through PAUSED→PLAYING so they renegotiate
-        // caps when the new stream starts. Without this, appsrc (is_live=false)
-        // rejects new caps in PLAYING state, producing not-negotiated errors.
+        // Set the new URI on source element
+        source_element.set_property("uri", &uri);
+
+        // Start playing again
+        pipeline.set_state(gst::State::Playing).map_err(|e| {
+            error!("Failed to start internal pipeline: {:?}", e);
+            "Failed to start playback".to_string()
+        })?;
+
+        // Cycle appsrc elements AFTER the internal pipeline reaches Playing.
+        // This forces caps renegotiation with the (potentially already
+        // created) bridge chain. Without this, appsrc rejects new caps in
+        // PLAYING state, causing not-negotiated errors.
         if let Some(ref appsrc) = self.video_appsrc {
             let elem = appsrc.upcast_ref::<gst::Element>();
             let _ = elem.set_state(gst::State::Paused);
@@ -242,23 +258,29 @@ impl MediaPlayerState {
             let _ = elem.set_state(gst::State::Paused);
             let _ = elem.set_state(gst::State::Playing);
         }
-
-        // Set the new URI on source element
-        source_element.set_property("uri", &uri);
-
-        // Start playing again
         pipeline.set_state(gst::State::Playing).map_err(|e| {
             error!("Failed to start internal pipeline: {:?}", e);
             "Failed to start playback".to_string()
         })?;
 
         self.is_paused.store(false, Ordering::SeqCst);
+        self.is_stopped.store(false, Ordering::SeqCst);
 
         Ok(())
     }
 
     /// Play the media.
+    ///
+    /// From `Stopped`, reloads the current file for a guaranteed fresh
+    /// start (the stopped pipeline may have reached EOS). From `Paused`,
+    /// resumes at the current position.
     pub fn play(&self) -> Result<(), String> {
+        if self.is_stopped.load(Ordering::SeqCst) {
+            self.switching_file.store(true, Ordering::SeqCst);
+            let r = self.load_current_file();
+            self.switching_file.store(false, Ordering::SeqCst);
+            return r;
+        }
         let pipeline_guard = self
             .internal_pipeline
             .read()
@@ -274,6 +296,7 @@ impl MediaPlayerState {
             "Failed to resume playback".to_string()
         })?;
         self.is_paused.store(false, Ordering::SeqCst);
+        self.is_stopped.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -294,10 +317,26 @@ impl MediaPlayerState {
         Ok(())
     }
 
-    /// Stop playback: pause and seek to the beginning.
+    /// Stop playback: return to the first file in the playlist, pause,
+    /// and seek to the beginning. The player reports `Stopped` until the
+    /// next play/goto/next/previous.
+    ///
+    /// Always reloads the file: a stream that reached EOS cannot reliably
+    /// be rewound with a flushing seek alone — resuming would immediately
+    /// re-emit EOS. Reloading guarantees a fresh, playable stream paused
+    /// at position 0.
     pub fn stop(&self) -> Result<(), String> {
+        if let Ok(mut pl) = self.playlist.write() {
+            if !pl.files.is_empty() {
+                pl.current_index = 0;
+            }
+        }
+        self.switching_file.store(true, Ordering::SeqCst);
+        self.load_current_file()?;
+        self.switching_file.store(false, Ordering::SeqCst);
         self.pause()?;
         self.seek(0)?;
+        self.is_stopped.store(true, Ordering::SeqCst);
         Ok(())
     }
 
@@ -392,7 +431,9 @@ impl MediaPlayerState {
     /// Get the current playback state.
     pub fn state(&self) -> strom_types::mediaplayer::PlayerState {
         use strom_types::mediaplayer::PlayerState;
-        if self.is_paused.load(Ordering::SeqCst) {
+        if self.is_stopped.load(Ordering::SeqCst) {
+            PlayerState::Stopped
+        } else if self.is_paused.load(Ordering::SeqCst) {
             PlayerState::Paused
         } else if self.playlist_len() == 0 {
             PlayerState::Stopped

@@ -349,14 +349,55 @@ fn link_pad_through_clocksync(
 
     let appsink_element = appsink.upcast_ref::<gst::Element>();
 
-    pipeline
-        .add_many([&clocksync, appsink_element])
-        .map_err(|e| format!("add elements: {}", e))?;
+    // For audio, normalize to a fixed format BEFORE the appsink so the
+    // outer pipeline never sees caps changes across clips. Files with
+    // different sample rates (44.1 kHz vs 48 kHz) would otherwise force a
+    // mid-stream renegotiation in the outer pipeline, which fails at the
+    // running audiomixer (no audioresample there) with not-negotiated,
+    // permanently killing the appsrc streaming task.
+    let audio_norm: Option<(gst::Element, gst::Element, gst::Element)> =
+        if media_type == "audio" {
+            let aconv = gst::ElementFactory::make("audioconvert")
+                .name(format!("{}_norm_convert", clocksync_name))
+                .build()
+                .map_err(|e| format!("audioconvert: {}", e))?;
+            let ares = gst::ElementFactory::make("audioresample")
+                .name(format!("{}_norm_resample", clocksync_name))
+                .build()
+                .map_err(|e| format!("audioresample: {}", e))?;
+            let caps = gst::Caps::builder("audio/x-raw")
+                .field("format", "F32LE")
+                .field("rate", 48_000i32)
+                .field("channels", 2i32)
+                .field("layout", "interleaved")
+                .build();
+            let acaps = gst::ElementFactory::make("capsfilter")
+                .name(format!("{}_norm_caps", clocksync_name))
+                .property("caps", &caps)
+                .build()
+                .map_err(|e| format!("capsfilter: {}", e))?;
+            Some((aconv, ares, acaps))
+        } else {
+            None
+        };
 
-    // Link downstream first: clocksync → appsink (no data flows yet)
-    clocksync
-        .link(appsink_element)
-        .map_err(|e| format!("link clocksync to appsink: {:?}", e))?;
+    if let Some((ref aconv, ref ares, ref acaps)) = audio_norm {
+        pipeline
+            .add_many([&clocksync, aconv, ares, acaps, appsink_element])
+            .map_err(|e| format!("add elements: {}", e))?;
+        // Link downstream first (no data flows yet):
+        // clocksync → audioconvert → audioresample → capsfilter → appsink
+        gst::Element::link_many([&clocksync, aconv, ares, acaps, appsink_element])
+            .map_err(|e| format!("link audio norm chain: {:?}", e))?;
+    } else {
+        pipeline
+            .add_many([&clocksync, appsink_element])
+            .map_err(|e| format!("add elements: {}", e))?;
+        // Link downstream first: clocksync → appsink (no data flows yet)
+        clocksync
+            .link(appsink_element)
+            .map_err(|e| format!("link clocksync to appsink: {:?}", e))?;
+    }
 
     // Start elements BEFORE linking upstream. urisourcebin's internal
     // multiqueue pushes buffered data the instant the upstream pad is
@@ -369,6 +410,12 @@ fn link_pad_through_clocksync(
     clocksync
         .set_state(gst::State::Playing)
         .map_err(|e| format!("set clocksync to Playing: {:?}", e))?;
+    if let Some((ref aconv, ref ares, ref acaps)) = audio_norm {
+        for (name, elem) in [("audioconvert", aconv), ("audioresample", ares), ("capsfilter", acaps)] {
+            elem.set_state(gst::State::Playing)
+                .map_err(|e| format!("set {} to Playing: {:?}", name, e))?;
+        }
+    }
     appsink_element
         .sync_state_with_parent()
         .map_err(|e| format!("sync appsink state: {:?}", e))?;
@@ -521,35 +568,53 @@ pub fn watch_internal_bus(
 
         match msg.view() {
             MessageView::Eos(_) => {
-                // Ignore EOS during file switch — the Ready→Playing transition
-                // can produce a spurious EOS from the old stream.
                 if state_for_bus
                     .switching_file
                     .load(std::sync::atomic::Ordering::SeqCst)
                 {
-                    debug!(
-                        "Media Player {}: Ignoring EOS during file switch",
-                        block_id_for_bus
-                    );
+                    debug!("Media Player {}: Ignoring EOS during file switch", block_id_for_bus);
                     return;
                 }
 
+                state_for_bus
+                    .switching_file
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+
                 info!("Media Player {}: Internal pipeline EOS", block_id_for_bus);
 
-                match state_for_bus.next() {
-                    Ok(_) => {
-                        info!("Media Player {}: Advanced to next file", block_id_for_bus);
+                let state = Arc::clone(&state_for_bus);
+                let events = events.clone();
+                let block_id = block_id_for_bus.clone();
+                // Schedule next() on the GLib main loop via idle_add, then
+                // keep switching_file=true for one additional iteration to
+                // suppress any spurious EOS posted during the state transition.
+                gst::glib::idle_add(move || {
+                    let state2 = Arc::clone(&state);
+                    let events2 = events.clone();
+                    let block_id2 = block_id.clone();
+                    match state.next() {
+                        Ok(_) => {
+                            info!("Media Player {}: Advanced to next file", block_id);
+                        }
+                        Err(e) => {
+                            info!("Media Player {}: End of playlist: {}", block_id, e);
+                            if let Err(se) = state.stop() {
+                                warn!("Media Player {}: Stop at end of playlist failed: {}", block_id, se);
+                            }
+                            events.broadcast(StromEvent::MediaPlayerStateChanged {
+                                flow_id,
+                                block_id: block_id.clone(),
+                                state: strom_types::mediaplayer::PlayerState::Stopped,
+                                current_file: None,
+                            });
+                        }
                     }
-                    Err(e) => {
-                        info!("Media Player {}: End of playlist: {}", block_id_for_bus, e);
-                        events.broadcast(StromEvent::MediaPlayerStateChanged {
-                            flow_id,
-                            block_id: block_id_for_bus.clone(),
-                            state: strom_types::mediaplayer::PlayerState::Stopped,
-                            current_file: None,
-                        });
-                    }
-                }
+                    gst::glib::idle_add(move || {
+                        state2.switching_file.store(false, std::sync::atomic::Ordering::SeqCst);
+                        gst::glib::ControlFlow::Break
+                    });
+                    gst::glib::ControlFlow::Break
+                });
             }
             MessageView::StateChanged(state_msg) => {
                 let is_pipeline = msg

@@ -8,7 +8,7 @@ use axum::{
 };
 pub use strom_types::mediaplayer::{
     GotoRequest, PlayerAction, PlayerControlRequest, PlayerStateResponse, SeekRequest,
-    SetPlaylistRequest,
+    SetLoopRequest, SetPlaylistRequest,
 };
 use strom_types::{api::ErrorResponse, element::PropertyValue, FlowId};
 use tracing::info;
@@ -120,13 +120,7 @@ pub async fn set_playlist(
     };
 
     if let Some(player) = MEDIA_PLAYER_REGISTRY.get(&key) {
-        let was_stopped = player.state() == strom_types::mediaplayer::PlayerState::Stopped;
         player.set_playlist(req.files);
-
-        // Only auto-start from the beginning if the player was stopped
-        if was_stopped && player.playlist_len() > 0 {
-            let _ = player.goto(0);
-        }
     }
 
     Ok(StatusCode::OK)
@@ -237,6 +231,48 @@ pub async fn seek_player(
             Json(ErrorResponse::with_details("Seek failed", e)),
         )
     })?;
+
+    Ok(StatusCode::OK)
+}
+
+/// Enable or disable playlist looping at runtime.
+///
+/// Looping is checked at each end-of-file, so this takes effect live —
+/// unlike the `loop_playlist` block property, which only applies at flow
+/// creation time.
+#[utoipa::path(
+    post,
+    path = "/api/flows/{flow_id}/blocks/{block_id}/player/loop",
+    tag = "media_player",
+    params(
+        ("flow_id" = String, Path, description = "Flow ID (UUID)"),
+        ("block_id" = String, Path, description = "Block ID")
+    ),
+    request_body = SetLoopRequest,
+    responses(
+        (status = 200, description = "Loop mode set"),
+        (status = 404, description = "Player not found", body = ErrorResponse)
+    )
+)]
+pub async fn set_loop(
+    State(_state): State<AppState>,
+    Path((flow_id, block_id)): Path<(FlowId, String)>,
+    JsonBody(req): JsonBody<SetLoopRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let key = MediaPlayerKey {
+        flow_id,
+        block_id: block_id.clone(),
+    };
+
+    let player = MEDIA_PLAYER_REGISTRY.get(&key).ok_or((
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse::new("Media player not found")),
+    ))?;
+
+    info!("Player {} loop: {}", block_id, req.enabled);
+    player
+        .loop_playlist
+        .store(req.enabled, std::sync::atomic::Ordering::SeqCst);
 
     Ok(StatusCode::OK)
 }

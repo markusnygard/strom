@@ -208,6 +208,7 @@ fn build_media_player(
             current_index: 0,
         }),
         is_paused: AtomicBool::new(false),
+        is_stopped: AtomicBool::new(false),
         loop_playlist: AtomicBool::new(loop_playlist),
         block_id: block_id.to_string(),
         flow_id,
