@@ -76,6 +76,21 @@ pub fn media_player_definition() -> BlockDefinition {
                 live: false,
                 persist: None,
             },
+            ExposedProperty {
+                name: "start_position_ns".to_string(),
+                label: "Start Position (ns)".to_string(),
+                description: "If >= 0, seek to this position after loading the file. Consumed once per goto. Set via PATCH before calling goto."
+                    .to_string(),
+                property_type: PropertyType::Int,
+                default_value: Some(PropertyValue::Int(-1)),
+                mapping: PropertyMapping {
+                    element_id: "_block".to_string(),
+                    property_name: "start_position_ns".to_string(),
+                    transform: None,
+                },
+                live: true,
+                persist: None,
+            },
         ],
         external_pads: ExternalPads {
             inputs: vec![],

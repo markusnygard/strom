@@ -321,6 +321,10 @@ pub async fn create_app_with_config(
             post(api::mediaplayer::goto_file),
         )
         .route(
+            "/flows/{flow_id}/blocks/{block_id}/player/start-position",
+            post(api::mediaplayer::set_start_position),
+        )
+        .route(
             "/flows/{flow_id}/blocks/{block_id}/player/loop",
             post(api::mediaplayer::set_loop),
         )

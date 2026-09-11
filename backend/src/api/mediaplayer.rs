@@ -10,6 +10,7 @@ pub use strom_types::mediaplayer::{
     GotoRequest, PlayerAction, PlayerControlRequest, PlayerStateResponse, SeekRequest,
     SetLoopRequest, SetPlaylistRequest,
 };
+use std::sync::atomic::Ordering;
 use strom_types::{api::ErrorResponse, element::PropertyValue, FlowId};
 use tracing::info;
 
@@ -232,6 +233,23 @@ pub async fn seek_player(
         )
     })?;
 
+    Ok(StatusCode::OK)
+}
+
+/// Set the start position offset loaded by the next GOTO call.
+/// Consumed once — after the next file load, the position resets to -1.
+pub async fn set_start_position(
+    State(_state): State<AppState>,
+    Path((flow_id, block_id)): Path<(FlowId, String)>,
+    Json(req): Json<SeekRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)> {
+    let key = MediaPlayerKey { flow_id, block_id: block_id.clone() };
+    let player = MEDIA_PLAYER_REGISTRY.get(&key).ok_or((
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse::new("Media player not found")),
+    ))?;
+    player.start_position_ns.store(req.position_ns as i64, Ordering::SeqCst);
+    info!("Player {} start position set to {} ns", block_id, req.position_ns);
     Ok(StatusCode::OK)
 }
 

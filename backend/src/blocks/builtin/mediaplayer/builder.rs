@@ -220,6 +220,7 @@ fn build_media_player(
         media_path: media_path.clone(),
         ts_offset,
         main_pipeline: gst::glib::WeakRef::new(),
+        start_position_ns: AtomicI64::new(-1),
     });
 
     // --- Resolve initial URI ---

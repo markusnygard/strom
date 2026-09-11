@@ -72,6 +72,8 @@ pub struct MediaPlayerState {
     pub ts_offset: Arc<AtomicI64>,
     /// Weak reference to the main pipeline (for computing running time in the bridge).
     pub main_pipeline: gst::glib::WeakRef<gst::Pipeline>,
+    /// Position to seek to after loading a file (set before goto, consumed by load_current_file_inner)
+    pub start_position_ns: AtomicI64,
 }
 
 impl MediaPlayerState {
@@ -237,6 +239,24 @@ impl MediaPlayerState {
 
         // Set the new URI on source element
         source_element.set_property("uri", &uri);
+
+        // Seek to start_position_ns in PAUSED state (GStreamer requires
+        // elements to be initialized). READY state is too early — the
+        // decoder hasn't created its pads yet.
+        let start_pos = self.start_position_ns.swap(-1, Ordering::SeqCst);
+        if start_pos >= 0 {
+            // Go to PAUSED to initialize decoders and pads
+            pipeline.set_state(gst::State::Paused).map_err(|e| {
+                error!("Failed to pause pipeline for seek: {:?}", e);
+                "Failed to pause for seek".to_string()
+            })?;
+            let secs = start_pos as u64 / 1_000_000_000;
+            info!("Seek to start position {} ns ({}.{:03}s) in PAUSED state", start_pos, secs, (start_pos as u64 / 1_000_000) % 1000);
+            source_element.seek_simple(
+                gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+                gst::ClockTime::from_nseconds(start_pos as u64),
+            );
+        }
 
         // Start playing again
         pipeline.set_state(gst::State::Playing).map_err(|e| {
