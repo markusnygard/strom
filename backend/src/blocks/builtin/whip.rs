@@ -154,6 +154,35 @@ fn parse_jitterbuffer_latency_ms(properties: &HashMap<String, PropertyValue>) ->
         .unwrap_or(400)
 }
 
+/// Parse do_retransmission from properties (default: true).
+fn parse_do_retransmission(properties: &HashMap<String, PropertyValue>) -> bool {
+    properties
+        .get("do_retransmission")
+        .and_then(|v| match v {
+            PropertyValue::Bool(b) => Some(*b),
+            _ => None,
+        })
+        .unwrap_or(true)
+}
+
+/// Keep a slot with no publisher from holding the pipeline out of PLAYING.
+///
+/// A `decodebin` cannot complete READY->PAUSED until data arrives and it can
+/// typefind, and a pipeline with any child still ASYNC never completes its own
+/// transition. Two guards, for the two moments this bites:
+/// - Locked state keeps an idle slot out of the pipeline's state changes
+///   entirely: it sits in NULL and contributes nothing to the aggregated state.
+/// - `async-handling` makes the decodebin absorb its own ASYNC once unlocked,
+///   so a slot claimed by a session that then sends no media cannot pull a
+///   running pipeline back out of PLAYING.
+///
+/// Neither hides a real preroll failure: a decodebin that errors still posts
+/// its ERROR to the pipeline bus.
+fn prepare_idle_decodebin(decodebin: &gst::Element) {
+    decodebin.set_property("async-handling", true);
+    decodebin.set_locked_state(true);
+}
+
 /// Build WHIP Input per-slot output chains.
 ///
 /// At build time, per-slot chains are created in the main pipeline:
@@ -164,6 +193,10 @@ fn parse_jitterbuffer_latency_ms(properties: &HashMap<String, PropertyValue>) ->
 /// The actual whipserversrc elements are created dynamically per-session
 /// by `create_whipserversrc_for_session` when clients connect. Each session
 /// is assigned a slot and its appsink feeds the slot's appsrc.
+///
+/// A slot's `decodebin` starts with its state locked (see
+/// `prepare_idle_decodebin`); `WhipEndpointConfig::allocate_slot` unlocks it
+/// when a session claims the slot.
 fn build_whipserversrc(
     instance_id: &str,
     properties: &HashMap<String, PropertyValue>,
@@ -203,6 +236,7 @@ fn build_whipserversrc(
     // causing the whole video stream to stall (never reaching decodebin)
     // even though the packets arrived fine over the network.
     let jitterbuffer_latency_ms = parse_jitterbuffer_latency_ms(properties);
+    let do_retransmission = parse_do_retransmission(properties);
 
     let max_video_bitrate_kbps = properties
         .get("max_video_bitrate")
@@ -238,6 +272,9 @@ fn build_whipserversrc(
     let mut internal_links: Vec<(ElementPadRef, ElementPadRef)> = Vec::new();
     let mut slot_audio_appsrcs: Vec<gst_app::AppSrc> = Vec::new();
     let mut slot_video_appsrcs: Vec<gst_app::AppSrc> = Vec::new();
+    // Per-slot decodebins, locked until a session claims the slot. Weak refs:
+    // the pipeline owns them.
+    let mut slot_decodebins: Vec<Vec<gst::glib::WeakRef<gst::Element>>> = Vec::new();
 
     // One flag per slot, set when decodebin exposes that slot's video pad.
     // A session stops asking the publisher for keyframes once its flag flips.
@@ -245,6 +282,8 @@ fn build_whipserversrc(
         Arc::new((0..max_sessions).map(|_| AtomicBool::new(false)).collect());
 
     for slot in 0..max_sessions {
+        let mut decodebins_for_slot: Vec<gst::glib::WeakRef<gst::Element>> = Vec::new();
+
         // Audio chain for this slot
         if mode.has_audio() {
             let appsrc_id = format!("{}:appsrc_audio_{}", instance_id, slot);
@@ -280,6 +319,9 @@ fn build_whipserversrc(
                     .map_err(|e| {
                         BlockBuildError::ElementCreation(format!("decodebin_audio_{}: {}", slot, e))
                     })?;
+
+                prepare_idle_decodebin(&decodebin);
+                decodebins_for_slot.push(decodebin.downgrade());
 
                 let audioconvert = gst::ElementFactory::make("audioconvert")
                     .name(&audioconvert_id)
@@ -383,6 +425,9 @@ fn build_whipserversrc(
                         BlockBuildError::ElementCreation(format!("decodebin_video_{}: {}", slot, e))
                     })?;
 
+                prepare_idle_decodebin(&decodebin);
+                decodebins_for_slot.push(decodebin.downgrade());
+
                 let videoconvert = gst::ElementFactory::make("videoconvert")
                     .name(&videoconvert_id)
                     .build()
@@ -443,14 +488,16 @@ fn build_whipserversrc(
             elements.push((appsrc_id, appsrc.upcast()));
             elements.push((video_out_tee_id, video_out_tee));
         }
+
+        slot_decodebins.push(decodebins_for_slot);
     }
 
     let stun_server = ctx.stun_server();
     let turn_server = ctx.turn_server();
 
     info!(
-        "WHIP Input configured: endpoint_id='{}', stun={:?}, turn={:?}, mode={:?}, decode={}, max_sessions={} (whipserversrc created per-session)",
-        endpoint_id, stun_server, turn_server, mode, decode, max_sessions
+        "WHIP Input configured: endpoint_id='{}', stun={:?}, turn={:?}, mode={:?}, decode={}, do_retransmission={}, max_sessions={} (whipserversrc created per-session)",
+        endpoint_id, stun_server, turn_server, mode, decode, do_retransmission, max_sessions
     );
 
     // Register WHIP endpoint with the build context (port=0 placeholder, sessions get their own ports)
@@ -472,11 +519,13 @@ fn build_whipserversrc(
             decode,
             video_decoding,
             jitterbuffer_latency_ms,
+            do_retransmission,
             dynamic_webrtcbin_store: ctx.dynamic_webrtcbin_store(),
             max_video_bitrate_kbps,
             max_sessions,
             slot_audio_appsrcs,
             slot_video_appsrcs,
+            slot_decodebins,
             slot_assignments,
         },
     );
@@ -489,6 +538,67 @@ fn build_whipserversrc(
     })
 }
 
+/// How long a session may go without a buffer before the watchdog tears it down.
+const INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often the watchdog re-checks its stop flag while waiting.
+const WATCHDOG_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Sleep until `deadline`, waking every `WATCHDOG_POLL` to re-check `stop`.
+///
+/// Returns true if `stop` was set (the caller should give up), false if the
+/// deadline was reached. The wait is sliced rather than one long sleep so a
+/// session's watchdog thread cannot outlive the session: a watchdog that fires
+/// after teardown asks the session manager to clean up a port it no longer knows,
+/// and the manager then marks that recycled port pending cleanup for nothing.
+fn wait_until_deadline_or_stop(stop: &AtomicBool, deadline: Instant) -> bool {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(WATCHDOG_POLL.min(deadline - now));
+    }
+}
+
+/// Block until the session has been idle for `timeout`, or until `stop` is set.
+///
+/// Returns `Some(idle_ms)` once the idle time crosses `timeout`, or `None` if a
+/// teardown path set `stop` first.
+///
+/// `last_buffer_ms` is the arrival time of the most recent buffer on any stream,
+/// as milliseconds since `epoch`; 0 means no buffer has arrived yet, in which case
+/// the session is still negotiating and the clock has not started.
+///
+/// Idle is re-evaluated on every `WATCHDOG_POLL` tick. The poll must stay finer than
+/// `timeout`: evaluating once per `timeout` puts detection anywhere between one and
+/// two full timeouts, since a drop landing just after a check goes unnoticed until
+/// the next one.
+fn wait_for_inactivity(
+    stop: &AtomicBool,
+    last_buffer_ms: &AtomicU64,
+    epoch: Instant,
+    timeout: std::time::Duration,
+) -> Option<u64> {
+    let timeout_ms = timeout.as_millis() as u64;
+    loop {
+        if wait_until_deadline_or_stop(stop, Instant::now() + WATCHDOG_POLL) {
+            return None;
+        }
+        let last = last_buffer_ms.load(Ordering::Relaxed);
+        if last == 0 {
+            continue;
+        }
+        let idle_ms = (epoch.elapsed().as_millis() as u64).saturating_sub(last);
+        if idle_ms >= timeout_ms {
+            return Some(idle_ms);
+        }
+    }
+}
+
 /// Create a new whipserversrc element for a single WHIP client session.
 ///
 /// Each session runs in its own isolated GStreamer pipeline to avoid
@@ -499,10 +609,15 @@ fn build_whipserversrc(
 /// appsrc targets are the pre-built slot elements.
 ///
 /// Returns (element, session_pipeline, port) on success.
+/// `cleanup_sent` is owned by the caller so it can be handed to the session
+/// manager alongside the session: every teardown path sets it, which both
+/// suppresses duplicate cleanup requests and stops this session's inactivity
+/// watchdog thread.
 pub fn create_whipserversrc_for_session(
     config: &WhipEndpointConfig,
     slot: usize,
     cleanup_tx: tokio::sync::mpsc::UnboundedSender<SessionCleanupRequest>,
+    cleanup_sent: Arc<AtomicBool>,
 ) -> Result<(gst::Element, gst::Pipeline, u16), String> {
     // Allocate a free port
     let listener =
@@ -547,6 +662,8 @@ pub fn create_whipserversrc_for_session(
     let signaller = whipserversrc.property::<gst::glib::Object>("signaller");
     signaller.set_property("host-addr", &host_addr);
 
+    whipserversrc.set_property("do-retransmission", config.do_retransmission);
+
     // Configure codec negotiation based on mode
     if config.mode.has_audio() {
         let audio_codecs = gst::Array::new(["OPUS"]);
@@ -568,9 +685,8 @@ pub fn create_whipserversrc_for_session(
     let block_id_for_callback = config.instance_id.clone();
     let ice_transport_policy = config.ice_transport_policy.clone();
     let jitterbuffer_latency_ms = config.jitterbuffer_latency_ms;
-    // Flag to ensure only one cleanup request per session (shared across ICE callback,
-    // inactivity watchdog, etc.)
-    let cleanup_sent = Arc::new(AtomicBool::new(false));
+    // `cleanup_sent` ensures only one cleanup request per session (shared across the
+    // ICE callback, the inactivity watchdog and the session manager's teardown paths).
     let cleanup_sent_for_ice = cleanup_sent.clone();
     let cleanup_tx_for_ice = cleanup_tx.clone();
 
@@ -702,9 +818,14 @@ pub fn create_whipserversrc_for_session(
 
     // Inactivity watchdog: tracks when the last buffer arrived on any stream.
     // A background thread checks this and triggers cleanup if no data arrives
-    // for INACTIVITY_TIMEOUT_SECS (covers the case where ICE disconnect
+    // for INACTIVITY_TIMEOUT (covers the case where ICE disconnect
     // notification doesn't fire from the isolated session pipeline).
-    const INACTIVITY_TIMEOUT_SECS: u64 = 10;
+    //
+    // The wait is sliced rather than one long sleep so that `cleanup_sent` — set by
+    // the ICE callback and by every teardown path in the session manager — ends the
+    // thread promptly. A watchdog that outlived its session would send a cleanup
+    // request for a port the manager no longer knows, and the manager would then mark
+    // that (recycled) port pending cleanup for nothing.
     let last_buffer_epoch = Instant::now();
     let last_buffer_ms = Arc::new(AtomicU64::new(0));
     {
@@ -714,33 +835,25 @@ pub fn create_whipserversrc_for_session(
         std::thread::Builder::new()
             .name(format!("whip-watchdog-{}", port))
             .spawn(move || {
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(INACTIVITY_TIMEOUT_SECS));
-                    // Exit if another path (ICE callback, DELETE) already triggered cleanup
-                    if cleanup_sent_watchdog.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let last = last_buffer_ms_watchdog.load(Ordering::Relaxed);
-                    if last == 0 {
-                        // No buffer received yet — keep waiting (session might still be negotiating)
-                        continue;
-                    }
-                    let elapsed_ms = last_buffer_epoch.elapsed().as_millis() as u64;
-                    let idle_ms = elapsed_ms.saturating_sub(last);
-                    if idle_ms >= INACTIVITY_TIMEOUT_SECS * 1000 {
-                        if !cleanup_sent_watchdog.swap(true, Ordering::SeqCst) {
-                            info!(
-                                "WHIP Input: Inactivity timeout ({}s idle) on port {}, triggering cleanup",
-                                idle_ms / 1000,
-                                port
-                            );
-                            let _ = cleanup_tx_watchdog.send(SessionCleanupRequest {
-                                port,
-                                reason: format!("inactivity ({}s idle)", idle_ms / 1000),
-                            });
-                        }
-                        break;
-                    }
+                // Returns None when another path (ICE callback, DELETE, flow stop)
+                // finished with this session first.
+                let Some(idle_ms) = wait_for_inactivity(
+                    &cleanup_sent_watchdog,
+                    &last_buffer_ms_watchdog,
+                    last_buffer_epoch,
+                    INACTIVITY_TIMEOUT,
+                ) else {
+                    return;
+                };
+                if !cleanup_sent_watchdog.swap(true, Ordering::SeqCst) {
+                    info!(
+                        "WHIP Input: Inactivity timeout ({}ms idle) on port {}, triggering cleanup",
+                        idle_ms, port
+                    );
+                    let _ = cleanup_tx_watchdog.send(SessionCleanupRequest {
+                        port,
+                        reason: format!("inactivity ({}ms idle)", idle_ms),
+                    });
                 }
             })
             .ok();
@@ -1523,6 +1636,20 @@ fn whip_input_definition() -> BlockDefinition {
                 persist: None,
             },
             ExposedProperty {
+                name: "do_retransmission".to_string(),
+                label: "Retransmission (RTX)".to_string(),
+                description: "Request retransmission of lost packets from the publisher (NACK-based). Without it, any packet loss forces a full keyframe request instead of a cheap resend.".to_string(),
+                property_type: PropertyType::Bool,
+                default_value: Some(PropertyValue::Bool(true)),
+                mapping: PropertyMapping {
+                    element_id: "_block".to_string(),
+                    property_name: "do_retransmission".to_string(),
+                    transform: None,
+                },
+                live: false,
+                persist: None,
+            },
+            ExposedProperty {
                 name: "max_video_bitrate".to_string(),
                 label: "Max Video Bitrate (kbps)".to_string(),
                 description: "Maximum video bitrate hint sent to the browser via SDP. The browser's encoder will ramp up to this value.".to_string(),
@@ -1740,5 +1867,165 @@ mod tests {
             )])),
             0
         );
+    }
+
+    #[test]
+    fn do_retransmission_defaults_to_true() {
+        assert!(parse_do_retransmission(&props(&[])));
+    }
+
+    #[test]
+    fn do_retransmission_respects_explicit_true() {
+        assert!(parse_do_retransmission(&props(&[(
+            "do_retransmission",
+            PropertyValue::Bool(true)
+        )])));
+    }
+
+    #[test]
+    fn do_retransmission_respects_explicit_false() {
+        assert!(!parse_do_retransmission(&props(&[(
+            "do_retransmission",
+            PropertyValue::Bool(false)
+        )])));
+    }
+
+    /// The inactivity watchdog must stop as soon as a teardown path sets the
+    /// session's `cleanup_sent` flag, not when its next timeout would have been.
+    /// A watchdog that outlives its session sends a cleanup request for a port the
+    /// session manager no longer knows, which marks that recycled port poisoned.
+    #[test]
+    fn watchdog_wait_returns_as_soon_as_the_stop_flag_is_set() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let setter = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            setter.store(true, Ordering::SeqCst);
+        });
+
+        // A deadline far beyond the flag: a wait that ignores the flag fails here by
+        // running the full 30 s, rather than returning in a poll interval.
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let started = Instant::now();
+        let stopped = wait_until_deadline_or_stop(&stop, deadline);
+
+        assert!(
+            stopped,
+            "wait must report that it was stopped, not timed out"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "wait took {:?} — it is not polling the stop flag",
+            started.elapsed()
+        );
+    }
+
+    /// With no stop flag set the wait must still run to its deadline, otherwise the
+    /// watchdog would never reach its inactivity check.
+    #[test]
+    fn watchdog_wait_runs_to_the_deadline_when_not_stopped() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let deadline = Instant::now() + std::time::Duration::from_millis(300);
+        let stopped = wait_until_deadline_or_stop(&stop, deadline);
+
+        assert!(!stopped, "wait must report a timeout, not a stop");
+        assert!(
+            Instant::now() >= deadline,
+            "wait returned before its deadline"
+        );
+    }
+
+    /// A dead session must be detected one poll interval after the inactivity
+    /// threshold, not one whole extra timeout later.
+    ///
+    /// The last buffer here lands 150 ms after the epoch, so the threshold is crossed
+    /// at ~1150 ms — just *after* a once-per-timeout check at 1000 ms would have run,
+    /// and far enough past it that scheduler slop cannot blur the two. Evaluating once
+    /// per `timeout` instead of once per poll fails this test: it detects at ~2000 ms,
+    /// where polling detects at ~1250 ms.
+    #[test]
+    fn watchdog_detects_inactivity_within_one_poll_of_the_timeout() {
+        let timeout = std::time::Duration::from_millis(1000);
+        let stop = Arc::new(AtomicBool::new(false));
+        let epoch = Instant::now();
+        let last_buffer_ms = Arc::new(AtomicU64::new(150));
+
+        let started = Instant::now();
+        let idle_ms = wait_for_inactivity(&stop, &last_buffer_ms, epoch, timeout)
+            .expect("watchdog must report inactivity, not a stop");
+        let detection = started.elapsed();
+
+        // Slack over the expected 1250 ms covers scheduler jitter but stays well
+        // clear of the 2000 ms the once-per-timeout evaluation would take.
+        assert!(
+            detection < std::time::Duration::from_millis(1600),
+            "inactivity took {:?} to detect with a {:?} timeout — idle is being \
+             evaluated once per timeout, not once per poll",
+            detection,
+            timeout
+        );
+        assert!(
+            idle_ms < 2 * timeout.as_millis() as u64,
+            "reported idle time was {} ms for a {:?} timeout — the check is too coarse",
+            idle_ms,
+            timeout
+        );
+    }
+
+    /// The inactivity wait must abandon a session the moment a teardown path claims
+    /// it, even though the session never went idle.
+    #[test]
+    fn watchdog_inactivity_wait_gives_up_when_stopped() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let epoch = Instant::now();
+        // Still negotiating: no buffer has arrived, so the idle clock never starts
+        // and only the stop flag can end the wait.
+        let last_buffer_ms = Arc::new(AtomicU64::new(0));
+
+        let setter = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            setter.store(true, Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let result = wait_for_inactivity(
+            &stop,
+            &last_buffer_ms,
+            epoch,
+            std::time::Duration::from_secs(30),
+        );
+
+        assert!(
+            result.is_none(),
+            "a stopped wait must not report inactivity"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "wait took {:?} — it is not polling the stop flag",
+            started.elapsed()
+        );
+    }
+
+    /// The block property must reach the `WhipEndpointConfig` handed to the
+    /// session manager, which is the value `create_whipserversrc_for_session`
+    /// applies to `whipserversrc`.
+    #[test]
+    fn do_retransmission_reaches_whip_endpoint_config() {
+        let _ = gst::init();
+
+        for expected in [true, false] {
+            let ctx = BlockBuildContext::new(Vec::new(), "all".to_string());
+            build_whipserversrc(
+                "whip-rtx-test",
+                &props(&[("do_retransmission", PropertyValue::Bool(expected))]),
+                &ctx,
+            )
+            .expect("build_whipserversrc failed");
+
+            let configs = ctx.take_whip_endpoint_configs();
+            assert_eq!(configs.len(), 1, "expected exactly one endpoint config");
+            assert_eq!(configs[0].1.do_retransmission, expected);
+        }
     }
 }

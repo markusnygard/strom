@@ -159,6 +159,11 @@ struct Args {
     #[arg(long, env = "STROM_MEDIA_PATH")]
     media_path: Option<PathBuf>,
 
+    /// Directory for the CEF/Chromium profile used by HTML sources and DSK
+    /// graphics (defaults to a per-instance directory in the OS cache directory)
+    #[arg(long, env = "STROM_CEF_CACHE_PATH")]
+    cef_cache_path: Option<PathBuf>,
+
     /// Database URL (e.g., postgresql://user:pass@localhost/strom)
     /// If set, database storage is used instead of JSON files
     /// Supported schemes: postgresql://
@@ -218,10 +223,26 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Drop Strom variables that are set but blank, which orchestrators forward
+    // for settings nobody configured. This brackets dotenvy on both sides and
+    // has to stay in this window: before clap reads the environment, and before
+    // any thread exists (see strom_types::env).
+    //
+    // Before, because dotenvy declines to set any key that env::var reports as
+    // Ok -- and Ok("") counts as set. An exported blank would otherwise shadow
+    // a real value in .env and then be deleted, losing both. After, so blanks
+    // coming from .env itself are caught too. Logging is not up yet, so the
+    // names are reported further down.
+    let mut blank_env_vars = strom_types::env::remove_blank_owned_vars();
+
     // Load environment variables from a local .env file if present (e.g.
     // STROM_OSC_PAT). Real environment variables always take precedence, and a
     // missing .env is fine — this is a no-op in production deployments.
     let _ = dotenvy::dotenv();
+
+    blank_env_vars.extend(strom_types::env::remove_blank_owned_vars());
+    blank_env_vars.sort();
+    blank_env_vars.dedup();
 
     // Initialize process startup time before anything else
     strom::version::init_process_startup_time();
@@ -290,6 +311,7 @@ fn main() -> anyhow::Result<()> {
         args.flows_path.clone(),
         args.blocks_path.clone(),
         args.media_path.clone(),
+        args.cef_cache_path.clone(),
         args.database_url.clone(),
         args.tls_cert.clone(),
         args.tls_key.clone(),
@@ -305,6 +327,59 @@ fn main() -> anyhow::Result<()> {
             eprintln!("Failed to initialize logging: {}", e);
             std::process::exit(1);
         });
+
+    let (blank_credentials, blank_settings): (Vec<String>, Vec<String>) = blank_env_vars
+        .into_iter()
+        .partition(|key| strom_types::env::is_credential(key));
+    if !blank_settings.is_empty() {
+        info!(
+            "Ignored blank environment variables: {}",
+            blank_settings.join(", ")
+        );
+    }
+    if !blank_credentials.is_empty() {
+        warn!(
+            "Ignored blank credential environment variables: {} - these configure \
+             authentication, so unless another credential is set the instance \
+             accepts unauthenticated requests",
+            blank_credentials.join(", ")
+        );
+    }
+
+    // Give CEF (the `cefsrc` element behind HTML sources and DSK graphics) a
+    // per-instance cache directory. Native runs otherwise get Chromium's
+    // default, which warns
+    //
+    //   Please customize CefSettings.root_cache_path for your application. Use
+    //   of the default value may lead to unintended process singleton behavior.
+    //
+    // and leaves Chromium's process singleton shared: a second Strom instance
+    // on the same machine cannot start any cefsrc element, failing in
+    // gst_base_src_start() so the flow start returns 500 "Element failed to
+    // change its state". The resolved path is per data directory, so instances
+    // stay isolated while keeping a warm profile across restarts, which also
+    // cuts repeat flow-start latency. GST_CEF_CACHE_LOCATION always wins if it
+    // is already set — the strom-full Docker image sets it in its entrypoint.
+    //
+    // set_var is safe here: this is early in main(), before any thread is
+    // spawned and before GStreamer (and therefore CEF) is initialized.
+    match std::env::var_os("GST_CEF_CACHE_LOCATION") {
+        Some(existing) => info!(
+            "CEF cache directory: {} (from GST_CEF_CACHE_LOCATION)",
+            PathBuf::from(existing).display()
+        ),
+        None => {
+            if let Err(e) = std::fs::create_dir_all(&config.cef_cache_path) {
+                warn!(
+                    "Could not create CEF cache directory {}: {}",
+                    config.cef_cache_path.display(),
+                    e
+                );
+            }
+            std::env::set_var("GST_CEF_CACHE_LOCATION", &config.cef_cache_path);
+            info!("CEF cache directory: {}", config.cef_cache_path.display());
+        }
+    }
 
     // Determine if GUI should be enabled
     #[cfg(not(feature = "no-gui"))]
@@ -344,7 +419,7 @@ fn main() -> anyhow::Result<()> {
             )
         } else {
             // Headless mode: Run HTTP server on main thread
-            run_headless(
+            run_headless_entry(
                 config,
                 args.no_auto_restart,
                 log_reload_handle,
@@ -356,7 +431,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "no-gui")]
     {
         // Always headless when no-gui feature is enabled
-        run_headless(
+        run_headless_entry(
             config,
             args.no_auto_restart,
             log_reload_handle,
@@ -548,7 +623,75 @@ fn run_with_gui(
         error!("GUI error: {:?}", e);
     }
 
+    // Must run before library destructors; see `shutdown_overlay_timers`.
+    strom::blocks::builtin::vision_mixer::overlay::shutdown_overlay_timers();
+
     Ok(())
+}
+
+/// Entry point for headless mode.
+///
+/// On macOS, CEF (the `cefsrc` element used for HTML overlays) needs a Cocoa run
+/// loop on the main thread. Without one, starting a flow containing `cefsrc`
+/// blocks forever in `gst_cef_src_change_state` waiting for browser
+/// initialisation that nothing ever services. `gst_macos_main` runs a CFRunLoop
+/// on the main thread and our server on a secondary thread. GUI mode does not
+/// need this -- winit's event loop already runs a Cocoa run loop on main.
+fn run_headless_entry(
+    config: Config,
+    no_auto_restart: bool,
+    log_reload_handle: strom::state::LogReloadHandle,
+    default_log_filter: String,
+) -> anyhow::Result<()> {
+    // Before the CFRunLoop starts: without this the process is App-Napped into the
+    // background QoS band ~32 s in, and every pipeline after that runs on
+    // efficiency cores.
+    strom::macos_app_nap::hold_activity_for_process_lifetime();
+
+    #[cfg(target_os = "macos")]
+    {
+        gstreamer::macos_main(move || {
+            // `gst_macos_main` does not run this closure on the process main
+            // thread -- it takes that thread for the CFRunLoop and calls us on a
+            // thread it creates itself, which gets the raw pthread default stack
+            // (512 KB on macOS) rather than the main thread's 8 MB.
+            // `create_app_with_config` builds the OpenAPI spec, and utoipa's
+            // generated `openapi_spec()` is one deeply nested expression covering
+            // every `StromEvent` variant; it overflows that stack and kills the
+            // process with exit 132 and no panic message, before the HTTP server
+            // ever binds.
+            //
+            // Spawning a Rust thread is what fixes it, not the size below:
+            // `std::thread` defaults to a 2 MiB stack, and that is already
+            // enough today (measured -- it starts and binds normally without an
+            // explicit size). The 8 MB is headroom for the spec continuing to
+            // grow, so keep it, but do not remove the indirection: calling
+            // `run_headless` directly here dies with exit 132.
+            std::thread::Builder::new()
+                .name("strom-headless".into())
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || {
+                    run_headless(
+                        config,
+                        no_auto_restart,
+                        log_reload_handle,
+                        default_log_filter,
+                    )
+                })
+                .expect("failed to spawn headless thread")
+                .join()
+                .expect("headless thread panicked")
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        run_headless(
+            config,
+            no_auto_restart,
+            log_reload_handle,
+            default_log_filter,
+        )
+    }
 }
 
 #[tokio::main]
@@ -669,7 +812,12 @@ async fn run_headless(
         handle_for_signal.graceful_shutdown(Some(Duration::from_secs(10)));
     });
 
-    serve_with_tls(addr, app, handle, tls_config).await?;
+    let serve_result = serve_with_tls(addr, app, handle, tls_config).await;
+
+    // Must run before library destructors; see `shutdown_overlay_timers`.
+    strom::blocks::builtin::vision_mixer::overlay::shutdown_overlay_timers();
+
+    serve_result?;
 
     Ok(())
 }

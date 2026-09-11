@@ -221,6 +221,7 @@ fn build_media_player(
         ts_offset,
         main_pipeline: gst::glib::WeakRef::new(),
         start_position_ns: AtomicI64::new(-1),
+        bus_watch: std::sync::Mutex::new(None),
     });
 
     // --- Resolve initial URI ---
