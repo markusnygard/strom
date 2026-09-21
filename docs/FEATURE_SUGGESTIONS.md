@@ -40,13 +40,22 @@ interests you, open a GitHub issue or discussion.
 ## Intelligence & collaboration
 
 - **AI troubleshooting (enhanced MCP)** — natural-language pipeline creation, error diagnosis
-  from QoS data, and best-practice/anti-pattern detection on top of the existing MCP server.
+  from QoS data, and best-practice/anti-pattern detection on top of the existing MCP endpoint.
 - **Flow version control** — git-like history with visual diff and one-click rollback.
 - **Multi-user collaboration** — real-time co-editing, presence, role-based permissions, and
   audit logging.
 
 ## Platform & reach
 
+- **Publish straight to the big live platforms** — take Strom's RTMP output to YouTube Live
+  and Twitch and write down what an operator has to set. The transport side has landed: the
+  RTMP Output block speaks `rtmp` and `rtmps` and keeps the query string Twitch's
+  `?bandwidthtest=true` rides on, so a test broadcast can be verified in Twitch Inspector
+  without going live. What is left is the operator write-up, and a look at the encoder side —
+  the Video Encoder block pins no profile by default, which is fine from a 4:2:0 source but
+  follows a 4:2:2 or 10-bit one into a profile no platform ingest accepts, so a capture feed
+  may need `profile=high` set by hand. Both platforms also want an audio track and roughly
+  2-second keyframes.
 - **Kubernetes operator** — deploy flows as pods with resource limits and auto-scaling.
 - **Block marketplace** — browse and install community-contributed blocks.
 - **Mobile companion** — monitor status, start/stop flows, and receive alerts from a phone.

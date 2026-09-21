@@ -9,7 +9,9 @@
 //!
 //! Handles dynamic pad creation by linking new audio streams to a liveadder mixer.
 
-use crate::blocks::{BlockBuildContext, BlockBuildError, BlockBuildResult, BlockBuilder};
+use crate::blocks::{
+    set_ice_transport_policy, BlockBuildContext, BlockBuildError, BlockBuildResult, BlockBuilder,
+};
 use crate::gst::gl_bridge;
 use crate::gst::ice_preflight;
 use crate::gst::whep_probe::{self, WhepProbeRegistry};
@@ -183,6 +185,21 @@ fn parse_do_retransmission(properties: &HashMap<String, PropertyValue>) -> bool 
         .unwrap_or(true)
 }
 
+/// Parse drop_on_latency from properties (default: true).
+///
+/// True works around a GStreamer rtpjitterbuffer bug (see `build_whepsrc`'s
+/// iterate_recurse). False keeps late packets for a downstream WebRTC endpoint
+/// that buffers adaptively, and reinstates the stall.
+fn parse_drop_on_latency(properties: &HashMap<String, PropertyValue>) -> bool {
+    properties
+        .get("drop_on_latency")
+        .and_then(|v| match v {
+            PropertyValue::Bool(b) => Some(*b),
+            _ => None,
+        })
+        .unwrap_or(true)
+}
+
 /// Migrate a legacy `mode` property on a WHEP Output block to explicit
 /// `num_audio_tracks` / `num_video_tracks` counts, and drop `mode`.
 ///
@@ -293,6 +310,7 @@ fn build_whepsrc(
     // Get ICE servers from application config
     let stun_server = ctx.stun_server();
     let turn_server = ctx.turn_server();
+    let ice_transport_policy = ctx.resolve_ice_transport_policy(properties);
 
     // Get mixer latency (default 30ms - lower than default 200ms for lower latency)
     let mixer_latency_ms = properties
@@ -317,6 +335,7 @@ fn build_whepsrc(
             }
         })
         .unwrap_or(DEFAULT_JITTERBUFFER_LATENCY_MS as u32);
+    let drop_on_latency = parse_drop_on_latency(properties);
 
     // Create namespaced element IDs
     let instance_id_owned = instance_id.to_string();
@@ -344,6 +363,11 @@ fn build_whepsrc(
         whepsrc.set_property("turn-server", turn);
     }
 
+    // whepsrc owns the webrtcbin it builds and forwards this to it, so setting
+    // it here beats hooking the child: it lands before the element leaves NULL,
+    // which is the state webrtcbin requires for this property.
+    set_ice_transport_policy(&whepsrc, &ice_transport_policy, "WHEP Input (whepsrc)");
+
     if let Some(token) = &auth_token {
         whepsrc.set_property("auth-token", token);
     }
@@ -369,13 +393,15 @@ fn build_whepsrc(
             // of the mute gap instead of being output immediately.
             // Setting drop-on-latency on rtpbin propagates to all its
             // jitterbuffers, making them drop queued packets that exceed the
-            // configured latency — breaking the stall.
+            // configured latency — breaking the stall. Configurable because the
+            // workaround costs late packets a downstream WebRTC endpoint could
+            // still have used.
             // Upstream: https://gitlab.freedesktop.org/gstreamer/gst-plugins-good/-/merge_requests/951
             if name.starts_with("rtpbin") && element.has_property("drop-on-latency") {
-                element.set_property("drop-on-latency", true);
+                element.set_property("drop-on-latency", drop_on_latency);
                 info!(
-                    "WHEP Input (whepsrc): Set drop-on-latency=true on existing {}",
-                    name
+                    "WHEP Input (whepsrc): Set drop-on-latency={} on existing {}",
+                    drop_on_latency, name
                 );
             }
         }
@@ -483,8 +509,8 @@ fn build_whepsrc(
     });
 
     debug!(
-        "WHEP Input (whepsrc stable) configured: endpoint={}, stun={:?}, turn={:?}",
-        whep_endpoint, stun_server, turn_server
+        "WHEP Input (whepsrc stable) configured: endpoint={}, stun={:?}, turn={:?}, ice_transport_policy={}",
+        whep_endpoint, stun_server, turn_server, ice_transport_policy
     );
 
     // Internal links: liveadder -> capsfilter -> audioconvert -> audioresample
@@ -562,6 +588,7 @@ fn build_whepclientsrc(
     // Get ICE servers from application config
     let stun_server = ctx.stun_server();
     let turn_server = ctx.turn_server();
+    let ice_transport_policy = ctx.resolve_ice_transport_policy(properties);
 
     // Get mixer latency (default 30ms - lower than default 200ms for lower latency)
     let mixer_latency_ms = properties
@@ -586,6 +613,7 @@ fn build_whepclientsrc(
             }
         })
         .unwrap_or(DEFAULT_JITTERBUFFER_LATENCY_MS as u32);
+    let drop_on_latency = parse_drop_on_latency(properties);
 
     // Create namespaced element IDs
     let instance_id_owned = instance_id.to_string();
@@ -714,7 +742,7 @@ fn build_whepclientsrc(
     if let Ok(bin) = whepclientsrc.clone().downcast::<gst::Bin>() {
         let liveadder_weak2 = liveadder.downgrade();
         let whepclientsrc_weak = whepclientsrc.downgrade();
-        let ice_transport_policy = ctx.ice_transport_policy().to_string();
+        let ice_transport_policy = ice_transport_policy.clone();
 
         // Use deep-element-added to catch webrtcbin when it's created
         bin.connect("deep-element-added", false, move |values| {
@@ -725,10 +753,10 @@ fn build_whepclientsrc(
                 // Workaround for GStreamer rtpjitterbuffer packet_spacing bug:
                 // see comment in build_whepsrc iterate_recurse for details.
                 if element_name.starts_with("rtpbin") && element.has_property("drop-on-latency") {
-                    element.set_property("drop-on-latency", true);
+                    element.set_property("drop-on-latency", drop_on_latency);
                     info!(
-                        "WHEP Input (whepclientsrc): Set drop-on-latency=true on {}",
-                        element_name
+                        "WHEP Input (whepclientsrc): Set drop-on-latency={} on {}",
+                        drop_on_latency, element_name
                     );
                 }
 
@@ -902,8 +930,8 @@ fn build_whepclientsrc(
     }
 
     debug!(
-        "WHEP Input configured: endpoint={}, stun={:?}, turn={:?}",
-        whep_endpoint, stun_server, turn_server
+        "WHEP Input configured: endpoint={}, stun={:?}, turn={:?}, ice_transport_policy={}",
+        whep_endpoint, stun_server, turn_server, ice_transport_policy
     );
 
     // Internal links: liveadder -> capsfilter -> audioconvert -> audioresample
@@ -1019,6 +1047,7 @@ fn build_whepserversink(
     // Get ICE servers from application config
     let stun_server = ctx.stun_server();
     let turn_server = ctx.turn_server();
+    let ice_transport_policy = ctx.resolve_ice_transport_policy(properties);
 
     // Create whepserversink element
     // This is based on webrtcsink and handles encoding internally
@@ -1039,6 +1068,12 @@ fn build_whepserversink(
         let turn_servers = gst::Array::new([turn]);
         whepserversink.set_property("turn-servers", turn_servers);
     }
+
+    // webrtcsink applies this to every consumer's webrtcbin as it creates it,
+    // before that session's pipeline leaves NULL. The consumer-added handler
+    // below sets the same value again, which covers a webrtcsink that does not
+    // expose the property at all.
+    set_ice_transport_policy(&whepserversink, &ice_transport_policy, "WHEP Output");
 
     // Disable FEC; RTX (retransmission) is configurable, default on.
     // - FEC adds proactive redundancy packets on every stream (~50% constant
@@ -1163,7 +1198,7 @@ fn build_whepserversink(
     // Also register the webrtcbin for stats collection (since it's in a separate session pipeline).
     let dynamic_webrtcbin_store = ctx.dynamic_webrtcbin_store();
     let block_id_for_callback = instance_id.to_string();
-    let ice_transport_policy = ctx.ice_transport_policy().to_string();
+    let ice_transport_policy = ice_transport_policy.clone();
     whepserversink.connect("consumer-added", false, move |values| {
         let consumer_id = values[1].get::<String>().unwrap_or_default();
         let webrtcbin = values[2].get::<gst::Element>().unwrap();
@@ -2290,6 +2325,49 @@ fn whep_input_definition() -> BlockDefinition {
                 live: false,
                 persist: None,
             },
+            ExposedProperty {
+                name: "drop_on_latency".to_string(),
+                label: "Drop On Latency".to_string(),
+                description: "Drop queued packets that exceed the jitterbuffer latency instead of holding them. On by default: it works around a jitterbuffer bug that otherwise stalls the stream for the length of a mute gap. Turn it off when a downstream WebRTC endpoint has its own adaptive buffer and should decide what is too late.".to_string(),
+                property_type: PropertyType::Bool,
+                default_value: Some(PropertyValue::Bool(true)),
+                mapping: PropertyMapping {
+                    element_id: "_block".to_string(),
+                    property_name: "drop_on_latency".to_string(),
+                    transform: None,
+                },
+                live: false,
+                persist: None,
+            },
+            ExposedProperty {
+                name: "ice_transport_policy".to_string(),
+                label: "ICE Transport Policy".to_string(),
+                description: "Which ICE candidates this WHEP subscriber may use. Leave on the server default to follow the server-wide setting. Force TURN relay when host and server-reflexive candidates cannot cross the network in between — every candidate then goes through the configured TURN server, which requires one to be configured in the server's ICE servers.".to_string(),
+                property_type: PropertyType::Enum {
+                    values: vec![
+                        EnumValue {
+                            value: "".to_string(),
+                            label: Some("Server default".to_string()),
+                        },
+                        EnumValue {
+                            value: "all".to_string(),
+                            label: Some("All (host, srflx, relay)".to_string()),
+                        },
+                        EnumValue {
+                            value: "relay".to_string(),
+                            label: Some("Relay only (force TURN)".to_string()),
+                        },
+                    ],
+                },
+                default_value: Some(PropertyValue::String("".to_string())),
+                mapping: PropertyMapping {
+                    element_id: "_block".to_string(),
+                    property_name: "ice_transport_policy".to_string(),
+                    transform: None,
+                },
+                live: false,
+                persist: None,
+            },
         ],
         external_pads: ExternalPads {
             inputs: vec![],
@@ -2384,6 +2462,35 @@ fn whep_output_definition() -> BlockDefinition {
                 mapping: PropertyMapping {
                     element_id: "_block".to_string(),
                     property_name: "do_retransmission".to_string(),
+                    transform: None,
+                },
+                live: false,
+                persist: None,
+            },
+            ExposedProperty {
+                name: "ice_transport_policy".to_string(),
+                label: "ICE Transport Policy".to_string(),
+                description: "Which ICE candidates this WHEP playback endpoint may use. Leave on the server default to follow the server-wide setting. Force TURN relay when host and server-reflexive candidates cannot cross the network in between — every candidate then goes through the configured TURN server, which requires one to be configured in the server's ICE servers.".to_string(),
+                property_type: PropertyType::Enum {
+                    values: vec![
+                        EnumValue {
+                            value: "".to_string(),
+                            label: Some("Server default".to_string()),
+                        },
+                        EnumValue {
+                            value: "all".to_string(),
+                            label: Some("All (host, srflx, relay)".to_string()),
+                        },
+                        EnumValue {
+                            value: "relay".to_string(),
+                            label: Some("Relay only (force TURN)".to_string()),
+                        },
+                    ],
+                },
+                default_value: Some(PropertyValue::String("".to_string())),
+                mapping: PropertyMapping {
+                    element_id: "_block".to_string(),
+                    property_name: "ice_transport_policy".to_string(),
                     transform: None,
                 },
                 live: false,
@@ -2489,6 +2596,19 @@ mod tests {
         assert!(parse_do_retransmission(&raw_props(&[(
             "do_retransmission",
             PropertyValue::Bool(true)
+        )])));
+    }
+
+    #[test]
+    fn drop_on_latency_defaults_to_true() {
+        assert!(parse_drop_on_latency(&raw_props(&[])));
+    }
+
+    #[test]
+    fn drop_on_latency_respects_explicit_false() {
+        assert!(!parse_drop_on_latency(&raw_props(&[(
+            "drop_on_latency",
+            PropertyValue::Bool(false)
         )])));
     }
 

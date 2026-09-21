@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["types", "backend", "frontend", "mcp-server"]
+members = ["types", "backend", "frontend"]
 default-members = ["backend"]
 
 [workspace.package]
-version = "0.6.8"
+version = "0.6.9"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Per Enstedt <per.enstedt@eyevinn.se>"]
@@ -30,6 +30,7 @@ gstreamer = { version = "0.25", features = ["v1_22"] }
 gstreamer-app = { version = "0.25", features = ["v1_22"] }
 gstreamer-controller = { version = "0.25", features = ["v1_22"] }
 gstreamer-net = { version = "0.25", features = ["v1_22"] }
+gstreamer-rtp = { version = "0.25", features = ["v1_22"] }
 gstreamer-gl = { version = "0.25", features = ["v1_22"] }
 gstreamer-video = { version = "0.25", features = ["v1_22"] }
 # gio 0.22 matches the glib 0.22 transitive that gstreamer 0.25 pulls in.
