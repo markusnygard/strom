@@ -360,6 +360,7 @@ impl BlockBuilder for MpegTsSrtOutputBuilder {
         // missing element waits in the pending links forever, with no error.
         for i in 0..num_video_tracks {
             let suffix = video_track_suffix(num_video_tracks, i);
+            let video_pid = video_track_pid(i);
             let video_input_id = format!("{}:video_input{}", instance_id, suffix);
 
             let video_input = gst::ElementFactory::make("identity")
@@ -515,26 +516,11 @@ impl BlockBuilder for MpegTsSrtOutputBuilder {
                         }
                     };
 
-                    // Request a sink pad from mpegtsmux using the pad template
-                    // This lets mpegtsmux assign the appropriate PID automatically
-                    let pad_template = match mux.pad_template("sink_%d") {
-                        Some(t) => t,
-                        None => {
-                            error!(
-                                "MPEGTSSRT {}: mpegtsmux has no sink_%d pad template",
-                                instance_id_clone
-                            );
-                            return gst::PadProbeReturn::Ok;
-                        }
-                    };
-
-                    let mux_sink = match mux.request_pad(&pad_template, None, None) {
-                        Some(p) => p,
-                        None => {
-                            error!(
-                                "MPEGTSSRT {}: Failed to request pad from mpegtsmux",
-                                instance_id_clone
-                            );
+                    // Request the mpegtsmux sink pad for this track's fixed PID
+                    let mux_sink = match request_mux_pad(&mux, video_pid) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            error!("MPEGTSSRT {}: {}", instance_id_clone, e);
                             return gst::PadProbeReturn::Ok;
                         }
                     };
@@ -601,6 +587,7 @@ impl BlockBuilder for MpegTsSrtOutputBuilder {
             let instance_id_clone = instance_id.to_string();
             let audio_chain_inserted = Arc::new(AtomicBool::new(false));
             let track_index = i;
+            let audio_pid = audio_track_pid(num_video_tracks, i);
 
             if let Some(src_pad) = audio_input.static_pad("src") {
                 src_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |pad, info| {
@@ -674,7 +661,14 @@ impl BlockBuilder for MpegTsSrtOutputBuilder {
                     // Determine what audio chain to build based on caps
                     let result = if caps_name == "audio/x-raw" {
                         // Raw audio: need to encode to AAC
-                        build_raw_audio_chain(&bin, &mux, pad, &instance_id_clone, track_index)
+                        build_raw_audio_chain(
+                            &bin,
+                            &mux,
+                            pad,
+                            &instance_id_clone,
+                            track_index,
+                            audio_pid,
+                        )
                     } else if caps_name == "audio/mpeg" {
                         // AAC or MP3 - check mpegversion
                         let mpegversion = structure.get::<i32>("mpegversion").unwrap_or(4);
@@ -686,6 +680,7 @@ impl BlockBuilder for MpegTsSrtOutputBuilder {
                                 pad,
                                 &instance_id_clone,
                                 track_index,
+                                audio_pid,
                                 "mpegaudioparse",
                                 "MP3",
                             )
@@ -697,6 +692,7 @@ impl BlockBuilder for MpegTsSrtOutputBuilder {
                                 pad,
                                 &instance_id_clone,
                                 track_index,
+                                audio_pid,
                                 "aacparse",
                                 "AAC",
                             )
@@ -708,6 +704,7 @@ impl BlockBuilder for MpegTsSrtOutputBuilder {
                             pad,
                             &instance_id_clone,
                             track_index,
+                            audio_pid,
                             "ac3parse",
                             "AC3",
                         )
@@ -718,6 +715,7 @@ impl BlockBuilder for MpegTsSrtOutputBuilder {
                             pad,
                             &instance_id_clone,
                             track_index,
+                            audio_pid,
                             "dcaparse",
                             "DTS",
                         )
@@ -728,6 +726,7 @@ impl BlockBuilder for MpegTsSrtOutputBuilder {
                             pad,
                             &instance_id_clone,
                             track_index,
+                            audio_pid,
                             "opusparse",
                             "Opus",
                         )
@@ -806,6 +805,37 @@ fn video_track_suffix(num_video_tracks: usize, index: usize) -> String {
     }
 }
 
+/// PID of the first elementary stream. Video tracks take consecutive PIDs from
+/// here and audio tracks follow them, e.g. 1 video + 4 audio tracks:
+/// video 0x100, audio 0x101..=0x104.
+const FIRST_ES_PID: usize = 0x100;
+
+/// Fixed PID for video track `track`.
+fn video_track_pid(track: usize) -> usize {
+    FIRST_ES_PID + track
+}
+
+/// Fixed PID for audio track `track`, after all video tracks.
+fn audio_track_pid(num_video_tracks: usize, track: usize) -> usize {
+    FIRST_ES_PID + num_video_tracks + track
+}
+
+/// Request the mpegtsmux sink pad for a fixed PID (`sink_<pid>`).
+///
+/// The audio and video chains are linked when their caps arrive, which happens
+/// in no particular order. An unnamed request would give each track the next
+/// free PID in that order, so the tracks (and the PMT, which mpegtsmux sorts by
+/// PID) would come out shuffled from one start to the next. Naming the pad pins
+/// track N to the same PID every time.
+fn request_mux_pad(mux: &gst::Element, pid: usize) -> Result<gst::Pad, String> {
+    let pad_template = mux
+        .pad_template("sink_%d")
+        .ok_or("mpegtsmux has no sink_%d pad template")?;
+    let name = format!("sink_{}", pid);
+    mux.request_pad(&pad_template, Some(&name), None)
+        .ok_or_else(|| format!("failed to request pad {} from mpegtsmux", name))
+}
+
 /// Build audio chain for raw audio input: audioconvert -> audioresample -> avenc_aac -> aacparse -> mux
 fn build_raw_audio_chain(
     bin: &gst::Bin,
@@ -813,6 +843,7 @@ fn build_raw_audio_chain(
     identity_src_pad: &gst::Pad,
     instance_id: &str,
     track_index: usize,
+    pid: usize,
 ) -> Result<(), String> {
     // Create elements
     let audioconvert_name = format!("{}:audio_convert_{}", instance_id, track_index);
@@ -864,13 +895,8 @@ fn build_raw_audio_chain(
         .ok_or("audioconvert has no sink pad")?;
     let parser_src = parser.static_pad("src").ok_or("parser has no src pad")?;
 
-    // Request mux pad
-    let pad_template = mux
-        .pad_template("sink_%d")
-        .ok_or("mpegtsmux has no sink_%d pad template")?;
-    let mux_sink = mux
-        .request_pad(&pad_template, None, None)
-        .ok_or("failed to request pad from mpegtsmux")?;
+    // Request the mux pad for this track's fixed PID
+    let mux_sink = request_mux_pad(mux, pid)?;
 
     // Link chain
     identity_src_pad
@@ -898,12 +924,14 @@ fn build_raw_audio_chain(
 }
 
 /// Build audio chain for already-encoded audio: parser -> mux
+#[allow(clippy::too_many_arguments)]
 fn build_encoded_audio_chain(
     bin: &gst::Bin,
     mux: &gst::Element,
     identity_src_pad: &gst::Pad,
     instance_id: &str,
     track_index: usize,
+    pid: usize,
     parser_factory: &str,
     codec_name: &str,
 ) -> Result<(), String> {
@@ -926,13 +954,8 @@ fn build_encoded_audio_chain(
     let parser_sink = parser.static_pad("sink").ok_or("parser has no sink pad")?;
     let parser_src = parser.static_pad("src").ok_or("parser has no src pad")?;
 
-    // Request mux pad
-    let pad_template = mux
-        .pad_template("sink_%d")
-        .ok_or("mpegtsmux has no sink_%d pad template")?;
-    let mux_sink = mux
-        .request_pad(&pad_template, None, None)
-        .ok_or("failed to request pad from mpegtsmux")?;
+    // Request the mux pad for this track's fixed PID
+    let mux_sink = request_mux_pad(mux, pid)?;
 
     // Link chain
     identity_src_pad
@@ -1101,5 +1124,45 @@ fn mpegtssrt_output_definition() -> BlockDefinition {
             height: Some(3.0),
             ..Default::default()
         }),
+    }
+}
+
+#[cfg(test)]
+mod pid_tests {
+    use super::*;
+
+    #[test]
+    fn video_then_audio_pids_are_fixed_per_track() {
+        assert_eq!(video_track_pid(0), 0x100);
+        assert_eq!(audio_track_pid(1, 0), 0x101);
+        assert_eq!(audio_track_pid(1, 3), 0x104);
+    }
+
+    #[test]
+    fn audio_only_starts_at_first_pid() {
+        assert_eq!(audio_track_pid(0, 0), 0x100);
+        assert_eq!(audio_track_pid(0, 4), 0x104);
+    }
+
+    #[test]
+    fn video_and_audio_pids_never_overlap() {
+        let video: Vec<usize> = (0..2).map(video_track_pid).collect();
+        let audio: Vec<usize> = (0..8).map(|t| audio_track_pid(2, t)).collect();
+        assert!(video.iter().all(|v| !audio.contains(v)));
+    }
+
+    #[test]
+    fn request_mux_pad_names_the_pad_after_the_pid() {
+        gst::init().unwrap();
+        if gst::ElementFactory::find("mpegtsmux").is_none() {
+            eprintln!("skipping: mpegtsmux not available");
+            return;
+        }
+        let mux = gst::ElementFactory::make("mpegtsmux").build().unwrap();
+        // Request out of order: the pads still get the PIDs they ask for.
+        let late = request_mux_pad(&mux, audio_track_pid(1, 3)).unwrap();
+        let early = request_mux_pad(&mux, audio_track_pid(1, 0)).unwrap();
+        assert_eq!(late.name(), "sink_260");
+        assert_eq!(early.name(), "sink_257");
     }
 }
